@@ -111,9 +111,9 @@ IoT-плата (ESP32/Wokwi) через HTTP передає дані на Django
 Етап 5 - Безпека та тестування
 
 ## Поточний етап
-Етап 1 - початок проекту
+Етап 3 - IoT (ESP32, Wokwi)
 
-### Що зробили
+### Що зробили на Етапі 1
 Сервер працює, адмінка піднята на http://localhost:8000/admin/.
 
   Credentials суперюзера:
@@ -121,9 +121,6 @@ IoT-плата (ESP32/Wokwi) через HTTP передає дані на Django
   - Password: admin
   - Email: daniil.dyachenko.2018@gmail.com
 
-  Після першого входу зайди в Users → admin → Change password і встанови нормальний пароль.
-
-  Що було зроблено:
   - Django_Claude_Project/ → config/ (відповідно до CLAUDE.md)
   - Створено main додаток, моделі Device, Telemetry, SystemSettings (main/models.py:1)
   - Зареєстровано в адмінці з list_filter, list_editable, date_hierarchy (main/admin.py:1)
@@ -133,3 +130,47 @@ IoT-плата (ESP32/Wokwi) через HTTP передає дані на Django
   - settings.py повністю переписано: env-driven SECRET_KEY/DEBUG/ALLOWED_HOSTS/DB, PostgreSQL замість SQLite, додані rest_framework + main, TIME_ZONE='Europe/Kyiv'
   - Міграції згенеровано (main/migrations/0001_initial.py) і накочено в Postgres
   - Зробили відповідний коміт по Етапу 1.
+
+### Що зробили на Етапі 2
+REST API + бізнес-логіка готові. Усі ендпоінти відповідають через `docker compose`.
+
+  Що було додано:
+  - **Модель Device** розширена двома полями: `last_power_watts` (останнє значення з телеметрії) та `last_seen_at` (час останнього пакета). Міграція `main/migrations/0002_device_last_power_watts_device_last_seen_at.py`.
+  - **main/serializers.py** — DeviceSerializer (CRUD), DeviceStateSerializer (downlink для ESP32 — тільки `device_id` + `is_on`), TelemetryIngestSerializer (uplink з валідацією device_id → Device), TelemetryReadSerializer, SystemSettingsSerializer, ChartDataPointSerializer, CurrentLoadSerializer.
+  - **main/permissions.py** — `HasDeviceApiKey` з constant-time `hmac.compare_digest` перевіркою заголовка `X-API-Key` проти `settings.DEVICE_API_KEY`.
+  - **main/services.py** — алгоритм балансування:
+    - `record_telemetry()` — з `select_for_update`, оновлює `last_power_watts`/`last_seen_at` атомарно.
+    - `rebalance_load()` — у транзакції: спочатку shed-фаза (вимикає найнижчий пріоритет поки total > limit), потім restore-фаза з гістерезисом (вмикає back-on вимкнений пристрій ТІЛЬКИ якщо це не штовхне знову за ліміт).
+    - `ingest_and_rebalance()` — комбінований entry-point для view.
+    - Повертає `BalancingReport` (total, is_overloaded, shed_devices, restored_devices) для діагностики.
+    - Логування через `main` logger (INFO/WARNING).
+  - **main/views.py**:
+    - `POST /api/telemetry/` (X-API-Key required) — приймає uplink + запускає балансування.
+    - `GET /api/device-state/` (X-API-Key required) — список усіх або `?device_id=xxx` для одного.
+    - `GET /api/chart-data/?minutes=N` — Telemetry агрегована по хвилинам через `TruncMinute` + `Sum`.
+    - `GET/POST /api/settings/` — singleton SystemSettings.
+    - `GET /api/current-load/` — snapshot для dashboard.
+    - `DeviceViewSet` (`/api/devices/`) — повний CRUD + custom action `POST /api/devices/{pk}/toggle/`.
+  - **main/urls.py** — DefaultRouter для DeviceViewSet + explicit paths. Підключено в `config/urls.py` під `/api/`.
+  - **settings.py**: блок `REST_FRAMEWORK` (JSON+Browsable renderers, PageNumberPagination 50, SessionAuthentication), `LOGGING` для `main`.
+  - **main/tests.py** — 14 тестів, усі проходять:
+    - TelemetryIngest: відмова без/із неправильним X-API-Key, успішний прийом, валідація device_id/power.
+    - DeviceState: lookup single, lookup unknown (404), list all.
+    - BalancingAlgorithm: shed-1, shed-багатьох, restore-найвищого-пріоритету, skip-overload-restore, inactive-settings-pause.
+    - CurrentLoad: snapshot.
+  - Команда тестів: `docker exec energy_web python manage.py test main`.
+
+### API ендпоінти (фінальний контракт Етапу 2)
+| Метод | URL | Auth | Призначення |
+|---|---|---|---|
+| POST | `/api/telemetry/` | X-API-Key | ESP32 надсилає `{device_id, power_watts}`. Відповідь містить `telemetry` + `balancing` звіт. |
+| GET | `/api/device-state/?device_id=` | X-API-Key | ESP32 опитує стан реле (один або всі). |
+| GET | `/api/chart-data/?minutes=30` | open | Агреговані дані для Chart.js (timestamp + total_power_watts). |
+| GET | `/api/current-load/` | open | Snapshot для дашборда (total, limit, is_overloaded, devices). |
+| GET, POST | `/api/settings/` | open | Глобальний ліміт потужності. |
+| GET, POST, PUT, PATCH, DELETE | `/api/devices/` | open | CRUD пристроїв. |
+| POST | `/api/devices/{pk}/toggle/` | open | Ручне перемикання реле з UI. |
+
+> Open-ендпоінти будуть закриті session/token-auth на Етапі 5.
+
+
